@@ -9,5 +9,6 @@ func roundUp(v uint64) uint64 {
 	v |= v >> 16
 	v |= v >> 32
 	v++
+
 	return v
 }

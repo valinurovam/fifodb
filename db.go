@@ -1,38 +1,39 @@
 package fifodb
 
 import (
-	"github.com/pkg/errors"
 	"io/ioutil"
 	"os"
 	"path"
+	"sync"
+
+	"github.com/pkg/errors"
 )
 
-const dataSegmentsPattern = "data_%020d.dsf"
-const opsLogSegmentsPattern = "ops_%020d.osf"
+const (
+	dataSegmentsName      = "data"
+	dataSegmentsPattern   = dataSegmentsName + "_%020d.dsf"
+	opsLogSegmentsName    = "ops"
+	opsLogSegmentsPattern = opsLogSegmentsName + "_%020d.osf"
+)
 
-type Entry struct {
-	Data []byte
-
-	// internal fields
-	segID  uint32
-	offset uint32
-}
-
-// Db represents thread-safe FIFO disk queue with WAL of queue operations
-type Db struct {
+// DB represents thread-safe FIFO disk queue with WAL of queue operations.
+type DB struct {
 	path   string
 	sc     *segmentsController
 	opsLog *opsLog
+
+	lock   sync.RWMutex
+	closed bool
 }
 
-func Open(opt Options) (db *Db, msgLeft uint64, err error) {
+func Open(opt Options) (db *DB, msgLeft uint64, err error) {
 	opt.Path = path.Clean(opt.Path)
 
 	if err = os.MkdirAll(opt.Path, 0700); err != nil {
 		return nil, 0, errors.Wrapf(err, "create directory %s", opt.Path)
 	}
 
-	db = &Db{
+	db = &DB{
 		path: opt.Path,
 	}
 
@@ -50,11 +51,32 @@ func Open(opt Options) (db *Db, msgLeft uint64, err error) {
 	return
 }
 
-func (db *Db) SetReadPos(fileID uint32, offset uint32) error {
+func (db *DB) SetReadPos(fileID uint32, offset uint32) error {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
 	return db.sc.setReadPos(fileID, offset)
 }
 
-func (db *Db) Push(data []byte) (segID uint32, offset uint32, err error) {
+func (db *DB) Sync() error {
+	if err := db.sc.sync(); err != nil {
+		return errors.Wrap(err, "db logSegments sync")
+	}
+
+	if err := db.opsLog.sync(); err != nil {
+		return errors.Wrap(err, "db ops log sync")
+	}
+
+	return nil
+}
+
+func (db *DB) Push(data []byte) (segID uint32, offset uint32, err error) {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	if err = db.errOnClosed(); err != nil {
+		return
+	}
+
 	if segID, offset, err = db.sc.write(data); err != nil {
 		return
 	}
@@ -67,79 +89,145 @@ func (db *Db) Push(data []byte) (segID uint32, offset uint32, err error) {
 	return
 }
 
-func (db *Db) Sync() {
-	db.sc.sync()
-	db.opsLog.sync()
-}
+func (db *DB) Pop() (data []byte, segID uint32, offset uint32, err error) {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
 
-func (db *Db) Pop() (data []byte, segID uint32, offset uint32, err error) {
+	if err = db.errOnClosed(); err != nil {
+		return
+	}
+
 	return db.sc.read()
 }
 
-func (db *Db) Ack(segID uint32, offset uint32) error {
+func (db *DB) Ack(segID uint32, offset uint32) (err error) {
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+
+	if err = db.errOnClosed(); err != nil {
+		return
+	}
+
 	return db.opsLog.Delete(segID, offset)
 }
 
-func (db *Db) Nack(segID uint32, offset uint32) error {
-	return db.opsLog.Requeue(segID, offset)
+func (db *DB) Close() (err error) {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	if err = db.errOnClosed(); err != nil {
+		return
+	}
+
+	db.closed = true
+
+	if db.sc != nil {
+		if err = db.sc.Close(); err != nil {
+			return err
+		}
+	}
+
+	db.sc = nil
+
+	if db.opsLog != nil {
+		if err = db.opsLog.Close(); err != nil {
+			return err
+		}
+	}
+
+	db.opsLog = nil
+
+	return
 }
 
-func (db *Db) Close() (err error) {
-	err = db.sc.Close()
-	if err != nil {
+// Clean deletes all db files
+// Thread-safe.
+func (db *DB) Clean() (err error) {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	if err = db.errOnClosed(); err != nil {
+		return
+	}
+
+	if err := db.opsLog.Clean(); err != nil {
 		return err
 	}
-	return db.opsLog.Close()
+
+	if err := db.sc.Clean(); err != nil {
+		return err
+	}
+
+	if err := db.sc.load(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (db *Db) Delete() error {
-	return db.sc.Delete()
+func (db *DB) GetPath() string {
+	return db.path
 }
 
-func (db *Db) compactOnStartUp() (totalMsgLeft uint64, err error) {
-	var maxSegID, segID uint32
-	var segErr error
+func (db *DB) errOnClosed() error {
+	if db.closed {
+		return errors.New("db is closed")
+	}
+
+	return nil
+}
+
+func (db *DB) compactOnStartUp() (totalMsgLeft uint64, err error) {
+	var (
+		maxSegID, segID uint32
+		segErr          error
+		msgLeft         uint64
+	)
+
 	files, err := ioutil.ReadDir(db.path)
 	if err != nil {
 		return
 	}
 
 	for _, f := range files {
-		if segID, segErr = db.opsLog.getSegIDByFileName(f.Name()); segErr != nil {
+		if !db.opsLog.isCorrectFileName(f.Name()) {
 			continue
 		}
-		maxSegID = segID + 1
-	}
 
-	for segID := 0; segID < int(maxSegID); segID++ {
-		if msgLeft, err := db.compactSegment(true, uint32(segID)); err != nil {
-			return 0, err
-		} else {
-			totalMsgLeft = totalMsgLeft + msgLeft
+		if segID, segErr = db.opsLog.getSegIDByFileName(f.Name()); segErr != nil {
+			return 0, errors.Wrap(segErr, "compactOnStartUp error")
 		}
 
+		maxSegID = segID
+	}
+
+	for segID := 0; segID <= int(maxSegID); segID++ {
+		if msgLeft, err = db.compactSegment(true, uint32(segID)); err != nil {
+			return 0, errors.Wrap(err, "compactOnStartUp error")
+		}
+
+		totalMsgLeft += msgLeft
 	}
 
 	return
 }
 
-func (db *Db) compactSegment(startUp bool, segID uint32) (msgLeft uint64, err error) {
-	var (
-		meta *compactionMeta
-	)
+func (db *DB) compactSegment(startUp bool, segID uint32) (msgLeft uint64, err error) {
+	var meta *compactionMeta
+
 	if meta, err = db.opsLog.getDataForCompaction(segID); err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
+
 		return 0, err
 	}
+
 	if meta.full() {
-		if _, err = db.sc.compactSegment(segID, meta); err != nil {
-			return 0, err
-		}
 		if err = db.opsLog.release(segID); err != nil {
 			return 0, err
 		}
+
 		if err = os.Remove(db.sc.fileNameBySegID(segID)); err != nil {
 			return 0, err
 		}

@@ -5,30 +5,32 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path"
+	"strings"
 	"sync"
 
 	"github.com/golang-collections/go-datastructures/bitarray"
+	"github.com/pkg/errors"
 )
 
 const (
 	opWr = iota + 1
 	opDel
-	opReq
 )
 
 // opsLog represents log of operations of operations like
 // 	- write message (push)
-//	- delete message (ack/reject)
+//	- remove message (ack/reject)
 //	- requeue message (nack)
 //
-// We need that opsLog to handle messages that we should delete or requeue after storage (server) restart
-// Each segmentsController segment has it's own WAL segment
+// We need that opsLog to handle messages that we should remove or requeue after storage (server) restart
+// Each segmentsController segment has it's own WAL segment.
 type opsLog struct {
 	sync.RWMutex
-	path          string
-	segments      map[uint32]*logSegment
+	path        string
+	logSegments map[uint32]*logSegment
 }
 
 type logSegment struct {
@@ -46,6 +48,7 @@ func (seg *logSegment) sync() error {
 	if err := seg.wr.Flush(); err != nil {
 		return err
 	}
+
 	return seg.fd.Sync()
 }
 
@@ -53,39 +56,35 @@ func (seg *logSegment) close() error {
 	if err := seg.sync(); err != nil {
 		return err
 	}
+
 	return seg.fd.Close()
 }
 
 func newOperationsLog(path string) *opsLog {
-	wal := &opsLog{
-		path:     path,
-		segments: make(map[uint32]*logSegment),
+	log := &opsLog{
+		path:        path,
+		logSegments: make(map[uint32]*logSegment),
 	}
 
-	return wal
+	return log
 }
 
-// Write writes write operation into WAL
-func (log *opsLog) Write(segId uint32, offset uint32) error {
-	return log.writeOp(opWr, segId, offset)
+// Write writes write operation into WAL.
+func (log *opsLog) Write(segID uint32, offset uint32) error {
+	return log.writeOp(opWr, segID, offset)
 }
 
-// Delete writes delete operation into WAL
-func (log *opsLog) Delete(segId uint32, offset uint32) error {
-	return log.writeOp(opDel, segId, offset)
+// Delete writes remove operation into WAL.
+func (log *opsLog) Delete(segID uint32, offset uint32) error {
+	return log.writeOp(opDel, segID, offset)
 }
 
-// Requeue writes requeue operation into WAL
-func (log *opsLog) Requeue(segId uint32, offset uint32) error {
-	return log.writeOp(opReq, segId, offset)
-}
-
-func (log *opsLog) writeOp(op byte, segId uint32, offset uint32) error {
+func (log *opsLog) writeOp(op byte, segID uint32, offset uint32) error {
 	var (
 		seg *logSegment
 		err error
 	)
-	if seg, err = log.getSegment(segId); err != nil {
+	if seg, err = log.getSegment(segID); err != nil {
 		return err
 	}
 
@@ -100,7 +99,7 @@ func (log *opsLog) writeOp(op byte, segId uint32, offset uint32) error {
 
 func (log *opsLog) getSegment(segID uint32) (seg *logSegment, err error) {
 	log.RLock()
-	if seg, ok := log.segments[segID]; ok && seg != nil {
+	if seg, ok := log.logSegments[segID]; ok && seg != nil {
 		log.RUnlock()
 		return seg, nil
 	}
@@ -111,7 +110,7 @@ func (log *opsLog) getSegment(segID uint32) (seg *logSegment, err error) {
 		log.Unlock()
 		return nil, err
 	}
-	log.segments[segID] = seg
+	log.logSegments[segID] = seg
 	log.Unlock()
 
 	return seg, nil
@@ -135,9 +134,13 @@ func (log *opsLog) fileNameBySegID(segID uint32) string {
 
 func (log *opsLog) getSegIDByFileName(name string) (segID uint32, err error) {
 	if _, err = fmt.Sscanf(name, opsLogSegmentsPattern, &segID); err != nil {
-		return
+		return 0, errors.Wrapf(err, "get segId by file name '%s'", name)
 	}
 	return
+}
+
+func (log *opsLog) isCorrectFileName(name string) bool {
+	return strings.HasPrefix(name, opsLogSegmentsName)
 }
 
 func (log *opsLog) release(segID uint32) error {
@@ -159,13 +162,13 @@ func (log *opsLog) createAfterCompaction(offsets []uint32, segID uint32) (err er
 
 func (log *opsLog) getDataForCompaction(segID uint32) (meta *compactionMeta, err error) {
 	// we accumulate only requeue offset, cause if we have empty reqOffsets at the end
-	// we can delete log file
+	// we can remove log file
 	var (
-		segFd     *os.File
-		data      [8]byte
-		op        byte
-		offset    uint64
-		n         int
+		segFd  *os.File
+		data   [8]byte
+		op     byte
+		offset uint64
+		n      int
 	)
 
 	segFileName := log.fileNameBySegID(segID)
@@ -177,14 +180,14 @@ func (log *opsLog) getDataForCompaction(segID uint32) (meta *compactionMeta, err
 		return
 	}
 
-
 	fileStat, err := os.Stat(path.Join(log.path, fmt.Sprintf(dataSegmentsPattern, segID)))
+	if err != nil {
+		return nil, err
+	}
 	fileSize := uint64(fileStat.Size())
 	bitArraySize := roundUp(fileSize)
 
-
 	meta = &compactionMeta{
-		reqOffsets: bitarray.NewBitArray(bitArraySize),
 		delOffsets: bitarray.NewBitArray(bitArraySize),
 	}
 
@@ -204,13 +207,6 @@ func (log *opsLog) getDataForCompaction(segID uint32) (meta *compactionMeta, err
 		switch op {
 		case opWr:
 			meta.wrCnt++
-		case opReq:
-			if ok, _ := meta.reqOffsets.GetBit(offset); !ok {
-				if err = meta.reqOffsets.SetBit(offset); err != nil {
-					break
-				}
-				meta.reqCnt++
-			}
 		case opDel:
 			if ok, _ := meta.delOffsets.GetBit(offset); !ok {
 				if err = meta.delOffsets.SetBit(offset); err != nil {
@@ -236,7 +232,7 @@ func (log *opsLog) getDataForCompaction(segID uint32) (meta *compactionMeta, err
 func (log *opsLog) sync() error {
 	log.Lock()
 	defer log.Unlock()
-	for _, seg := range log.segments {
+	for _, seg := range log.logSegments {
 		if seg != nil {
 			if err := seg.sync(); err != nil {
 				return err
@@ -254,7 +250,7 @@ func (log *opsLog) syncSeg(segID uint32) error {
 	)
 	log.RLock()
 	defer log.RUnlock()
-	if seg, ok = log.segments[segID]; !ok || seg == nil {
+	if seg, ok = log.logSegments[segID]; !ok || seg == nil {
 		return fmt.Errorf("segment [%d] has not been opened yet", segID)
 	}
 
@@ -264,11 +260,47 @@ func (log *opsLog) syncSeg(segID uint32) error {
 func (log *opsLog) Close() error {
 	log.Lock()
 	defer log.Unlock()
-	for _, seg := range log.segments {
+	for idx, seg := range log.logSegments {
 		if seg != nil {
 			if err := seg.close(); err != nil {
 				return err
 			}
+
+			delete(log.logSegments, idx)
+		}
+	}
+
+	return nil
+}
+
+// Clean
+func (log *opsLog) Clean() error {
+	log.Lock()
+	defer log.Unlock()
+
+	for idx, seg := range log.logSegments {
+		if seg != nil {
+			if err := seg.close(); err != nil {
+				return err
+			}
+
+			delete(log.logSegments, idx)
+		}
+	}
+
+	files, err := ioutil.ReadDir(log.path)
+	if err != nil {
+		return errors.Wrapf(err, "failed to read opslog's directory: %s", log.path)
+	}
+
+	var segID uint32
+	for _, f := range files {
+		if segID, err = log.getSegIDByFileName(f.Name()); err != nil {
+			continue
+		}
+
+		if err := os.Remove(log.fileNameBySegID(segID)); err != nil && !os.IsNotExist(err) {
+			return err
 		}
 	}
 
@@ -281,9 +313,6 @@ type compactionMeta struct {
 	delCnt uint64
 
 	delOffsets bitarray.BitArray
-	reqOffsets bitarray.BitArray
-
-	needCompact bool
 }
 
 // Write writes write operation into WAL

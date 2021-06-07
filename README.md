@@ -1,6 +1,6 @@
 ## FifoDB - persistent fifo disk-based queue
 
-Thread-safe FIFO disk queue with WAL of queue (push, ack, nack, reject) operations
+Thread-safe FIFO-queue backend by a filesystem and acknowledgement opportunity.
 
 ### Motivation
 
@@ -15,7 +15,7 @@ Basic ideas of storage is
 - stores data in 64MB segments for compaction performance (configurable)
 - stores data strongly in FIFO order
 - retrieves data strongly in FIFO order
-- supports 4 main methods - Push, Pop, Ack, Nack
+- supports 4 main methods - Push, Pop, Ack
 
 ### Usage
 

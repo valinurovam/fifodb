@@ -1,6 +1,7 @@
 package fifodb
 
 import (
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -43,27 +44,26 @@ func BenchmarkDBPut65536(b *testing.B) {
 }
 
 func BenchmarkDBGet16(b *testing.B) {
-	benchmarkDBGet(16, b)
+	// benchmarkDBGet(16, b)
 }
 func BenchmarkDBGet64(b *testing.B) {
-	benchmarkDBGet(64, b)
+	// benchmarkDBGet(64, b)
 }
 func BenchmarkDBGet256(b *testing.B) {
-	benchmarkDBGet(256, b)
+	// benchmarkDBGet(256, b)
 }
 func BenchmarkDBGet1024(b *testing.B) {
-	benchmarkDBGet(1024, b)
+	// benchmarkDBGet(1024, b)
 }
 func BenchmarkDBGet4096(b *testing.B) {
-	benchmarkDBGet(4096, b)
+	// benchmarkDBGet(4096, b)
 }
 func BenchmarkDBGet16384(b *testing.B) {
-	benchmarkDBGet(16384, b)
+	// benchmarkDBGet(16384, b)
 }
 func BenchmarkDBGet65536(b *testing.B) {
-	benchmarkDBGet(65536, b)
+	// benchmarkDBGet(65536, b)
 }
-
 
 //func BenchmarkDBPutMult16(b *testing.B) {
 //	benchmarkDBPutMulti(16, b)
@@ -99,7 +99,7 @@ func benchmarkDBPut(size int64, b *testing.B) {
 	//	b.Fatal(err)
 	//}
 
-	err = db.Delete()
+	err = os.RemoveAll(db.GetPath())
 	if err != nil {
 		b.Fatal(err)
 	}
