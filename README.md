@@ -1,4 +1,4 @@
-## FifoDB - persistent fifo disk-based queue
+## FifoDB - persistent fifo disk-based queue [![Build Status](https://travis-ci.org/valinurovam/fifodb.svg?branch=main)](https://travis-ci.org/valinurovam/fifodb) [![Coverage Status](https://coveralls.io/repos/github/valinurovam/fifodb/badge.svg)](https://coveralls.io/github/valinurovam/fifodb) [![Go Report Card](https://goreportcard.com/badge/github.com/valinurovam/fifodb)](https://goreportcard.com/report/github.com/valinurovam/fifodb)
 
 Thread-safe FIFO-queue backend by a filesystem and acknowledgement opportunity.
 
