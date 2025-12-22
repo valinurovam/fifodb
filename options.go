@@ -1,5 +1,7 @@
 package fifodb
 
+import "log"
+
 // Options are params for creating DB object.
 type Options struct {
 	// Directory to store the data. Would be created if not exists.
@@ -14,8 +16,8 @@ type Options struct {
 	// Maximum size of each segment file.
 	MaxBytesPerSegment uint32
 
-	// Fsync each write
-	Fsync bool
+	// Logger — if nil, no logging
+	Logger Logger
 }
 
 // DefaultOptions contains options that should work for most applications
@@ -23,5 +25,5 @@ var DefaultOptions = Options{
 	WriteBufferSize:    128 << 10,
 	ReadBufferSize:     128 << 10,
 	MaxBytesPerSegment: 128 << 20,
-	Fsync:              false,
+	Logger:             log.Default(),
 }

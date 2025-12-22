@@ -1,7 +1,6 @@
 package fifodb
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"sync"
@@ -10,35 +9,44 @@ import (
 )
 
 const (
-	dataSegmentsName      = "data"
-	dataSegmentsPattern   = dataSegmentsName + "_%020d.dsf"
-	opsLogSegmentsName    = "ops"
-	opsLogSegmentsPattern = opsLogSegmentsName + "_%020d.osf"
+	segmentsName        = "segment"
+	dataSegmentsPattern = segmentsName + "_%020d.dat"
+	walSegmentsSuffix   = "wal"
+	walSegmentsPattern  = segmentsName + "_%020d." + walSegmentsSuffix
 )
 
 // DB represents thread-safe FIFO disk queue with WAL of queue operations.
 type DB struct {
-	path   string
-	sc     *segmentsController
-	opsLog *opsLog
+	path string
+	sc   *segmentsController
+	wal  *walController
 
 	lock   sync.RWMutex
 	closed bool
+
+	log Logger
 }
 
 func Open(opt Options) (db *DB, msgLeft uint64, err error) {
+	log := opt.Logger
+	if log == nil {
+		log = &noopLogger{}
+	}
+
 	opt.Path = path.Clean(opt.Path)
 
 	if err = os.MkdirAll(opt.Path, 0700); err != nil {
-		return nil, 0, errors.Wrapf(err, "create directory %s", opt.Path)
+		log.Printf("failed to create directory %s", opt.Path)
+		return nil, 0, errors.Wrapf(err, "failed to create directory %s", opt.Path)
 	}
 
 	db = &DB{
 		path: opt.Path,
+		log:  log,
 	}
 
 	db.sc = newSegmentsController(opt)
-	db.opsLog = newOperationsLog(opt.Path)
+	db.wal = newWalController(opt.Path, db.log)
 
 	if msgLeft, err = db.compactOnStartUp(); err != nil {
 		return
@@ -57,13 +65,18 @@ func (db *DB) SetReadPos(fileID uint32, offset uint32) error {
 	return db.sc.setReadPos(fileID, offset)
 }
 
+// Sync flushes all pending data to stable storage.
+// It is NOT safe to call Sync concurrently with Push, Ack, or Pop.
+// The caller must ensure external synchronization if concurrent access is needed.
 func (db *DB) Sync() error {
 	if err := db.sc.sync(); err != nil {
-		return errors.Wrap(err, "db logSegments sync")
+		db.log.Printf("db: failed to sync data segments")
+		return errors.Wrap(err, "db: failed to sync data segments")
 	}
 
-	if err := db.opsLog.sync(); err != nil {
-		return errors.Wrap(err, "db ops log sync")
+	if err := db.wal.sync(); err != nil {
+		db.log.Printf("db: failed to sync ops log")
+		return errors.Wrap(err, "db: failed to sync ops log")
 	}
 
 	return nil
@@ -81,7 +94,7 @@ func (db *DB) Push(data []byte) (segID uint32, offset uint32, err error) {
 		return
 	}
 
-	err = db.opsLog.Write(segID, offset)
+	err = db.wal.Write(segID, offset)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -108,7 +121,7 @@ func (db *DB) Ack(segID uint32, offset uint32) (err error) {
 		return
 	}
 
-	return db.opsLog.Delete(segID, offset)
+	return db.wal.Delete(segID, offset)
 }
 
 func (db *DB) Close() (err error) {
@@ -129,13 +142,13 @@ func (db *DB) Close() (err error) {
 
 	db.sc = nil
 
-	if db.opsLog != nil {
-		if err = db.opsLog.Close(); err != nil {
+	if db.wal != nil {
+		if err = db.wal.Close(); err != nil {
 			return err
 		}
 	}
 
-	db.opsLog = nil
+	db.wal = nil
 
 	return
 }
@@ -150,7 +163,7 @@ func (db *DB) Clean() (err error) {
 		return
 	}
 
-	if err := db.opsLog.Clean(); err != nil {
+	if err := db.wal.Clean(); err != nil {
 		return err
 	}
 
@@ -184,17 +197,18 @@ func (db *DB) compactOnStartUp() (totalMsgLeft uint64, err error) {
 		msgLeft         uint64
 	)
 
-	files, err := ioutil.ReadDir(db.path)
+	files, err := os.ReadDir(db.path)
 	if err != nil {
 		return
 	}
 
 	for _, f := range files {
-		if !db.opsLog.isCorrectFileName(f.Name()) {
+		if !db.wal.isCorrectFileName(f.Name()) {
 			continue
 		}
 
-		if segID, segErr = db.opsLog.getSegIDByFileName(f.Name()); segErr != nil {
+		if segID, segErr = db.wal.getSegIDByFileName(f.Name()); segErr != nil {
+			db.log.Printf("error on compactOnStartUp: %v", segErr)
 			return 0, errors.Wrap(segErr, "compactOnStartUp error")
 		}
 
@@ -203,7 +217,8 @@ func (db *DB) compactOnStartUp() (totalMsgLeft uint64, err error) {
 
 	for segID := 0; segID <= int(maxSegID); segID++ {
 		if msgLeft, err = db.compactSegment(true, uint32(segID)); err != nil {
-			return 0, errors.Wrap(err, "compactOnStartUp error")
+			db.log.Printf("compactSegment failed on segId %d: %v", segID, err)
+			return 0, errors.Wrap(err, "compactOnStartUp error, compactSegment failed")
 		}
 
 		totalMsgLeft += msgLeft
@@ -215,7 +230,7 @@ func (db *DB) compactOnStartUp() (totalMsgLeft uint64, err error) {
 func (db *DB) compactSegment(startUp bool, segID uint32) (msgLeft uint64, err error) {
 	var meta *compactionMeta
 
-	if meta, err = db.opsLog.getDataForCompaction(segID); err != nil {
+	if meta, err = db.wal.getDataForCompaction(segID); err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
@@ -224,7 +239,7 @@ func (db *DB) compactSegment(startUp bool, segID uint32) (msgLeft uint64, err er
 	}
 
 	if meta.full() {
-		if err = db.opsLog.release(segID); err != nil {
+		if err = db.wal.release(segID); err != nil {
 			return 0, err
 		}
 
@@ -237,12 +252,12 @@ func (db *DB) compactSegment(startUp bool, segID uint32) (msgLeft uint64, err er
 			if offsets, err = db.sc.compactSegment(segID, meta); err != nil {
 				return 0, err
 			}
-			if err = db.opsLog.release(segID); err != nil {
+			if err = db.wal.release(segID); err != nil {
 				return 0, err
 			}
 
 			if len(offsets) > 0 {
-				if err = db.opsLog.createAfterCompaction(offsets, segID); err != nil {
+				if err = db.wal.createAfterCompaction(offsets, segID); err != nil {
 					return 0, err
 				}
 			}
