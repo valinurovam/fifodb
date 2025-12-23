@@ -304,6 +304,53 @@ func TestCrashRecovery_SingleSegment(t *testing.T) {
 	assert.Nil(t, data)
 }
 
+func TestCrashRecovery_PushNotAcked_WALBuffered(t *testing.T) {
+	dir := t.TempDir()
+
+	// Open DB with large WAL buffer (64KB) so Push operation stays in memory,
+	// and small segment buffer (1 byte) to ensure message is written to disk immediately.
+	db, _, err := fifodb.Open(fifodb.Options{
+		Path:               dir,
+		MaxBytesPerSegment: 1024,  // small segment size
+		WriteBufferSize:    1,     // forces immediate write to segment file
+		WALWriteBufferSize: 65536, // large WAL buffer — data stays in memory
+	})
+	assert.NoError(t, err)
+
+	// Push a message. It will be written to the segment file (due to WriteBufferSize=1),
+	// but the corresponding Push op will remain in WAL buffer (not flushed to disk).
+	msg := []byte("important message")
+	segID, offset, err := db.Push(msg)
+	assert.NoError(t, err)
+	_ = segID
+	_ = offset
+
+	// Simulate crash: do NOT call db.Close(), so WAL buffer is never flushed.
+	// This mimics a kill -9 scenario.
+
+	// Reopen the database
+	db2, _, err := fifodb.Open(fifodb.Options{
+		Path:               dir,
+		MaxBytesPerSegment: 1024,
+		WriteBufferSize:    1,
+		ReadBufferSize:     1,
+		WALWriteBufferSize: 1, // buffer size doesn't matter on read
+	})
+	assert.NoError(t, err)
+	defer db2.Close()
+
+	// The message must still be present — even though WAL was empty on disk.
+	data, _, _, err := db2.Pop()
+	assert.NoError(t, err)
+	assert.NotNil(t, data)
+	assert.Equal(t, msg, data)
+
+	// Queue should be empty after popping the message
+	data, _, _, err = db2.Pop()
+	assert.NoError(t, err)
+	assert.Nil(t, data)
+}
+
 func openDB(msgCount int, t *testing.T) (db *fifodb.DB, msgLeft uint64, err error) {
 	opt := fifodb.DefaultOptions
 	opt.WriteBufferSize = 1    // to avoid bufferization

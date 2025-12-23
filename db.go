@@ -216,7 +216,7 @@ func (db *DB) compactOnStartUp() (totalMsgLeft uint64, err error) {
 	}
 
 	for segID := 0; segID <= int(maxSegID); segID++ {
-		if msgLeft, err = db.compactSegment(true, uint32(segID)); err != nil {
+		if msgLeft, err = db.compactSegment(uint32(segID)); err != nil {
 			db.log.Printf("compactSegment failed on segId %d: %v", segID, err)
 			return 0, errors.Wrap(err, "compactOnStartUp error, compactSegment failed")
 		}
@@ -227,7 +227,7 @@ func (db *DB) compactOnStartUp() (totalMsgLeft uint64, err error) {
 	return
 }
 
-func (db *DB) compactSegment(startUp bool, segID uint32) (msgLeft uint64, err error) {
+func (db *DB) compactSegment(segID uint32) (msgLeft uint64, err error) {
 	var meta *compactionMeta
 
 	if meta, err = db.wal.getDataForCompaction(segID); err != nil {
@@ -238,7 +238,14 @@ func (db *DB) compactSegment(startUp bool, segID uint32) (msgLeft uint64, err er
 		return 0, err
 	}
 
-	if meta.full() {
+	var (
+		anyMessageKept bool
+		offsets        []uint32
+	)
+	if offsets, anyMessageKept, err = db.sc.compactSegment(segID, meta); err != nil {
+		return 0, err
+	}
+	if !anyMessageKept {
 		if err = db.wal.release(segID); err != nil {
 			return 0, err
 		}
@@ -246,26 +253,17 @@ func (db *DB) compactSegment(startUp bool, segID uint32) (msgLeft uint64, err er
 		if err = os.Remove(db.sc.fileNameBySegID(segID)); err != nil {
 			return 0, err
 		}
-	} else if startUp {
-		if meta.needCompactLog() {
-			var offsets []uint32
-			if offsets, err = db.sc.compactSegment(segID, meta); err != nil {
-				return 0, err
-			}
-			if err = db.wal.release(segID); err != nil {
-				return 0, err
-			}
-
-			if len(offsets) > 0 {
-				if err = db.wal.createAfterCompaction(offsets, segID); err != nil {
-					return 0, err
-				}
-			}
-			msgLeft = uint64(len(offsets))
-		} else {
-			msgLeft = meta.wrCnt
-		}
+		return 0, nil
 	}
+
+	if err = db.wal.release(segID); err != nil {
+		return 0, err
+	}
+
+	if err = db.wal.createAfterCompaction(offsets, segID); err != nil {
+		return 0, err
+	}
+	msgLeft = uint64(len(offsets)) // number of unacknowledged messages after compaction
 
 	return
 }
