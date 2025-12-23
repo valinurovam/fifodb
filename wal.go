@@ -174,12 +174,12 @@ func (wal *walController) getDataForCompaction(segID uint32) (meta *compactionMe
 		n      int
 	)
 
-	segFileName := wal.fileNameBySegID(segID)
-	if _, err = os.Stat(segFileName); os.IsNotExist(err) {
+	walSegFileName := wal.fileNameBySegID(segID)
+	if _, err = os.Stat(walSegFileName); os.IsNotExist(err) {
 		return
 	}
 
-	if segFd, err = os.OpenFile(segFileName, os.O_RDONLY, 0600); err != nil {
+	if segFd, err = os.OpenFile(walSegFileName, os.O_RDONLY, 0600); err != nil {
 		return
 	}
 
