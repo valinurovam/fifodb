@@ -16,6 +16,9 @@ type Options struct {
 	// Maximum size of each segment file.
 	MaxBytesPerSegment uint32
 
+	// Size of bytes for WAL to keep in memory before persisting to avoid much write syscalls.
+	WALWriteBufferSize uint32
+
 	// Logger — if nil, no logging
 	Logger Logger
 }

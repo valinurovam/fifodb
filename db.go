@@ -46,7 +46,7 @@ func Open(opt Options) (db *DB, msgLeft uint64, err error) {
 	}
 
 	db.sc = newSegmentsController(opt)
-	db.wal = newWalController(opt.Path, db.log)
+	db.wal = newWalController(opt.Path, opt.WALWriteBufferSize, db.log)
 
 	if msgLeft, err = db.compactOnStartUp(); err != nil {
 		return
