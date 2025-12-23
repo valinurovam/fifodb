@@ -50,6 +50,7 @@ Unlike Kafka or RabbitMQ, `fifodb` is a **library**, not a service. It runs in y
 
 `fifodb` is well-suited for:
 
+- **AI agents and LLM-powered applications** requiring reliable, local task queues or action logs (e.g., offline agents, edge AI),
 - Embedded systems (IoT, edge devices) requiring local queuing,
 - Applications that prefer to avoid external dependencies like Redis or Kafka,
 - Scenarios where predictable resource usage and simplicity are valued over distributed features,
