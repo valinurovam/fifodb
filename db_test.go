@@ -3,19 +3,19 @@ package fifodb_test
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/stretchr/testify/assert"
 	"os"
 	"runtime"
 	"sync/atomic"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/valinurovam/fifodb"
 )
 
 const (
-	defaultBytesPerSegment = 64 << 10 // 1kb
+	defaultBytesPerSegment = 1 << 10 // 1kb
 	defaultMessageCount    = 100
 )
 
@@ -267,8 +267,52 @@ func TestDb_Push_Pop_Concurrently(t *testing.T) {
 	assert.EqualValues(t, pushCnt, popCnt)
 }
 
+func TestCrashRecovery_SingleSegment(t *testing.T) {
+	db, _, err := openDB(0, t)
+	assert.NoError(t, err)
+
+	msg1 := []byte("message-1")
+	msg2 := []byte("message-2")
+	msg3 := []byte("message-3")
+
+	segId1, offsetId1, err := db.Push(msg1)
+	assert.NoError(t, err)
+	_, _, err = db.Push(msg2)
+	assert.NoError(t, err)
+	_, _, err = db.Push(msg3)
+	assert.NoError(t, err)
+
+	// Подтверждаем только msg1
+	err = db.Ack(segId1, offsetId1)
+	assert.NoError(t, err)
+
+	// 2. НЕ вызываем db.Close() — имитация crash
+	// (буферы не сбрасываются, WAL может быть неполным)
+
+	// 3. Перезапускаем очередь
+	db2, _, err := openDB(0, t)
+	defer db2.Close()
+
+	// 4. Проверяем восстановление
+	// Должны получить msg2 и msg3 (msg1 подтверждён → удалён)
+	data, _, _, err := db2.Pop()
+	assert.NoError(t, err)
+	assert.Equal(t, msg2, data)
+
+	data, _, _, err = db2.Pop()
+	assert.NoError(t, err)
+	assert.Equal(t, msg3, data)
+
+	// Очередь должна быть пуста
+	data, _, _, err = db2.Pop()
+	assert.NoError(t, err)
+	assert.Nil(t, data)
+}
+
 func openDB(msgCount int, t *testing.T) (db *fifodb.DB, msgLeft uint64, err error) {
 	opt := fifodb.DefaultOptions
+	opt.WriteBufferSize = 1    // to avoid bufferization
+	opt.WALWriteBufferSize = 1 // to avoid bufferization
 	opt.MaxBytesPerSegment = defaultBytesPerSegment
 	opt.Path = fmt.Sprintf("test/%s", t.Name())
 	db, msgLeft, err = fifodb.Open(opt)

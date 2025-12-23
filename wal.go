@@ -27,6 +27,7 @@ type walController struct {
 	sync.RWMutex
 	path     string
 	segments map[uint32]*segmentWAL
+	bufSize  uint32
 
 	log Logger
 }
@@ -61,10 +62,11 @@ func (seg *segmentWAL) close() error {
 	return seg.fd.Close()
 }
 
-func newWalController(path string, log Logger) *walController {
+func newWalController(path string, bufSize uint32, log Logger) *walController {
 	return &walController{
 		path:     path,
 		segments: make(map[uint32]*segmentWAL),
+		bufSize:  bufSize,
 		log:      log,
 	}
 }
@@ -124,7 +126,7 @@ func (wal *walController) openWalSegment(segID uint32) (seg *segmentWAL, err err
 	}
 
 	// @todo 64<<10 can that bufferSize be configurable?
-	seg.wr = bufio.NewWriterSize(seg.fd, 64<<10)
+	seg.wr = bufio.NewWriterSize(seg.fd, int(wal.bufSize))
 	seg.segID = segID
 	return seg, nil
 }
