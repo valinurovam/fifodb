@@ -282,19 +282,14 @@ func TestCrashRecovery_SingleSegment(t *testing.T) {
 	_, _, err = db.Push(msg3)
 	assert.NoError(t, err)
 
-	// Подтверждаем только msg1
 	err = db.Ack(segId1, offsetId1)
 	assert.NoError(t, err)
 
-	// 2. НЕ вызываем db.Close() — имитация crash
-	// (буферы не сбрасываются, WAL может быть неполным)
-
-	// 3. Перезапускаем очередь
+	// reopen db - kill -9 imitation
 	db2, _, err := openDB(0, t)
 	defer db2.Close()
 
-	// 4. Проверяем восстановление
-	// Должны получить msg2 и msg3 (msg1 подтверждён → удалён)
+	// expect msg2 and msg3
 	data, _, _, err := db2.Pop()
 	assert.NoError(t, err)
 	assert.Equal(t, msg2, data)
