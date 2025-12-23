@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"os"
 	"path"
 	"sync"
@@ -15,9 +14,9 @@ import (
 )
 
 const (
-	headerDataSize = 4
-	headerCRCSize  = 4
-	headerSize     = headerDataSize + headerCRCSize
+	headerDataSize = 4                              // uint32: message length
+	headerCRCSize  = 4                              // uint32: CRC32 of message data
+	headerSize     = headerDataSize + headerCRCSize // total header size
 )
 
 // meta represents current read or write file index and offset inside.
@@ -54,7 +53,9 @@ type segmentsController struct {
 	writeHeaderBuf [8]byte
 	readHeaderBuf  [8]byte
 
-	crc32Table *crc32.Table
+	crc32Table    *crc32.Table
+	messageReader *messageReader
+	logger        Logger
 }
 
 func newSegmentsController(opt Options) *segmentsController {
@@ -67,6 +68,8 @@ func newSegmentsController(opt Options) *segmentsController {
 		metaRead:           &meta{},
 		metaWrite:          &meta{},
 		crc32Table:         crc32.MakeTable(crc32.Castagnoli),
+		messageReader:      &messageReader{},
+		logger:             opt.Logger,
 	}
 }
 
@@ -241,13 +244,14 @@ func (sc *segmentsController) flushWriter() (err error) {
 // if end offset will be over than maxBytesPerSegment go to next read file too
 func (sc *segmentsController) readOne() (data []byte, segID uint32, offset uint32, err error) {
 	var (
-		size uint32
 		// to once goto startRead
 		once bool
 	)
 
 startRead:
-	if _, err := io.ReadFull(sc.reader, sc.readHeaderBuf[:]); err != nil {
+	size, checkSum, data, err := sc.messageReader.ReadMessage(sc.reader)
+
+	if err != nil {
 		if err == io.EOF {
 			// if it happens when writer buffered but not already flushed?
 			// let's check and try to flush it
@@ -264,7 +268,7 @@ startRead:
 			// less than maxBytesPerSegment
 
 			if err = sc.openNextReadSegment(); err != nil {
-				// next segment does not exists or any error happens
+				// next segment does not exist or any error happens
 				if os.IsNotExist(err) {
 					err = nil
 				}
@@ -278,20 +282,10 @@ startRead:
 		return nil, 0, 0, sc.nonEOFOnly(err)
 	}
 
-	size = binary.BigEndian.Uint32(sc.readHeaderBuf[:4])
-	checkSum := binary.BigEndian.Uint32(sc.readHeaderBuf[4:])
-
-	data = make([]byte, size)
-
-	if _, err := io.ReadFull(sc.reader, data); err != nil {
-		return nil, 0, 0, sc.nonEOFOnly(err)
-	}
-
 	expectedSum := crc32.Checksum(data, sc.crc32Table)
 
 	if checkSum != expectedSum {
-		return nil, 0, 0, errors.Wrapf(
-			err,
+		return nil, 0, 0, fmt.Errorf(
 			"check crc32 failed, expected %d, actual %d", expectedSum, checkSum,
 		)
 	}
@@ -426,53 +420,59 @@ func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta)
 	writer := bufio.NewWriterSize(fdTmp, int(sc.writeBufferSize))
 
 	var (
-		size      uint32
-		sizeBytes [4]byte
 		newOffset uint32
 		readerPos uint32
 	)
 
-	for err != io.EOF || err == nil {
-		_, err = io.ReadFull(reader, sizeBytes[:])
-		if err != nil {
+	mr := &messageReader{}
+
+	for {
+		size, crc, data, readErr := mr.ReadMessage(reader)
+		if readErr != nil {
+			err = readErr
 			break
 		}
-		size = binary.BigEndian.Uint32(sizeBytes[:])
 
-		if ok, _ := meta.delOffsets.GetBit(uint64(readerPos)); ok {
-			// discard data + crc32
-			if _, err = reader.Discard(int(size) + 4); err != nil {
-				break
-			}
-			readerPos += 4 + size + 4
+		expectedCRC := crc32.Checksum(data, sc.crc32Table)
+		if crc != expectedCRC {
+			sc.logger.Printf("skipping corrupted message at pos %d", readerPos)
+			readerPos += headerSize + size
 			continue
 		}
 
-		if _, err = writer.Write(sizeBytes[:]); err != nil {
-			break
+		if ok, _ := meta.delOffsets.GetBit(uint64(readerPos)); ok {
+			// skip data
+		} else {
+			// copy: size + crc + data
+			sizeBytes := make([]byte, headerDataSize)
+			binary.BigEndian.PutUint32(sizeBytes, size)
+			if _, err := writer.Write(sizeBytes); err != nil {
+				return nil, err
+			}
+			crcBytes := make([]byte, headerCRCSize)
+			binary.BigEndian.PutUint32(crcBytes, crc)
+			if _, err := writer.Write(crcBytes); err != nil {
+				return nil, err
+			}
+			if _, err := writer.Write(data); err != nil {
+				return nil, err
+			}
+			newOffsets = append(newOffsets, newOffset)
+			newOffset += headerSize + size // size + crc + data
 		}
-		// copy data + crc32
-		if _, err = io.CopyN(writer, reader, int64(size)+4); err != nil {
-			break
-		}
-		newOffsets = append(newOffsets, newOffset)
-		newOffset = newOffset + 4 + size + 4
-		readerPos += 4 + size + 4
+
+		readerPos += headerSize + size
 	}
 
 	if err != nil {
 		if err == io.EOF {
 			// all is ok, ignore
 		} else if err == io.ErrUnexpectedEOF {
-			log.Printf("segment truncated at pos %d, ignoring partial message", readerPos)
+			sc.logger.Printf("segment truncated at pos %d, ignoring partial message", readerPos)
 		} else {
 			// something really going wrong
 			return nil, err
 		}
-	}
-
-	if err != nil && err != io.EOF {
-		return nil, err
 	}
 
 	if err = writer.Flush(); err != nil {
@@ -506,7 +506,7 @@ func (sc *segmentsController) Clean() error {
 		return errors.Wrapf(err, "failed to read segment's directory: %s", sc.path)
 	}
 
-	// find closest files to read and write
+	// find the closest files to read and write
 	var segID uint32
 	for _, f := range files {
 		if segID, err = sc.getSegIDByFileName(f.Name()); err != nil {
