@@ -397,14 +397,14 @@ func (sc *segmentsController) rotateSegmentIfFull() error {
 	return nil
 }
 
-func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta) (newOffsets []uint32, err error) {
+func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta) (newOffsets []uint32, anyMessageKept bool, err error) {
 	var (
 		fd, fdTmp *os.File
 	)
 	fileName := sc.fileNameBySegID(segID)
 	fileNameTmp := fileName + ".tmp"
 	if fd, err = os.OpenFile(fileName, os.O_RDONLY, 0600); err != nil {
-		return newOffsets, errors.Wrapf(err, "failed to open segment file: %s", fileName)
+		return newOffsets, anyMessageKept, errors.Wrapf(err, "failed to open segment file: %s", fileName)
 	}
 	defer func() {
 		if closeErr := fd.Close(); closeErr != nil && err == nil {
@@ -413,7 +413,7 @@ func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta)
 	}()
 
 	if fdTmp, err = os.OpenFile(fileNameTmp, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600); err != nil {
-		return newOffsets, errors.Wrapf(err, "failed to create temp file: %s", fileNameTmp)
+		return newOffsets, anyMessageKept, errors.Wrapf(err, "failed to create temp file: %s", fileNameTmp)
 	}
 
 	reader := bufio.NewReaderSize(fd, int(sc.readBufferSize))
@@ -443,19 +443,20 @@ func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta)
 		if ok, _ := meta.delOffsets.GetBit(uint64(readerPos)); ok {
 			// skip data
 		} else {
+			anyMessageKept = true
 			// copy: size + crc + data
 			sizeBytes := make([]byte, headerDataSize)
 			binary.BigEndian.PutUint32(sizeBytes, size)
 			if _, err := writer.Write(sizeBytes); err != nil {
-				return nil, err
+				return nil, anyMessageKept, err
 			}
 			crcBytes := make([]byte, headerCRCSize)
 			binary.BigEndian.PutUint32(crcBytes, crc)
 			if _, err := writer.Write(crcBytes); err != nil {
-				return nil, err
+				return nil, anyMessageKept, err
 			}
 			if _, err := writer.Write(data); err != nil {
-				return nil, err
+				return nil, anyMessageKept, err
 			}
 			newOffsets = append(newOffsets, newOffset)
 			newOffset += headerSize + size // size + crc + data
@@ -471,23 +472,23 @@ func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta)
 			sc.logger.Printf("segment truncated at pos %d, ignoring partial message", readerPos)
 		} else {
 			// something really going wrong
-			return nil, err
+			return nil, anyMessageKept, err
 		}
 	}
 
 	if err = writer.Flush(); err != nil {
-		return newOffsets, errors.Wrapf(err, "failed to flush writer for file: %s", fileNameTmp)
+		return newOffsets, anyMessageKept, errors.Wrapf(err, "failed to flush writer for file: %s", fileNameTmp)
 	}
 
 	if err = fdTmp.Sync(); err != nil {
-		return nil, errors.Wrapf(err, "failed to sync temp file: %s", fileNameTmp)
+		return nil, anyMessageKept, errors.Wrapf(err, "failed to sync temp file: %s", fileNameTmp)
 	}
 
 	if err = fdTmp.Close(); err != nil {
-		return nil, errors.Wrapf(err, "failed to close temp file: %s", fileNameTmp)
+		return nil, anyMessageKept, errors.Wrapf(err, "failed to close temp file: %s", fileNameTmp)
 	}
 
-	return newOffsets, os.Rename(fileNameTmp, fileName)
+	return newOffsets, anyMessageKept, os.Rename(fileNameTmp, fileName)
 }
 
 // Clean deletes all data.
