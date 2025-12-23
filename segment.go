@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
+	"log"
 	"os"
 	"path"
 	"sync"
@@ -51,7 +51,6 @@ type segmentsController struct {
 	readBufferSize     uint32
 	maxBytesPerSegment uint32
 
-	fsync          bool
 	writeHeaderBuf [8]byte
 	readHeaderBuf  [8]byte
 
@@ -64,7 +63,6 @@ func newSegmentsController(opt Options) *segmentsController {
 		filesPattern:       opt.Path + dataSegmentsPattern,
 		writeBufferSize:    opt.WriteBufferSize,
 		readBufferSize:     opt.ReadBufferSize,
-		fsync:              opt.Fsync,
 		maxBytesPerSegment: opt.MaxBytesPerSegment,
 		metaRead:           &meta{},
 		metaWrite:          &meta{},
@@ -84,12 +82,12 @@ func (sc *segmentsController) load() error {
 		segID, minSegID, maxSegID uint32
 	)
 
-	files, err := ioutil.ReadDir(sc.path)
+	files, err := os.ReadDir(sc.path)
 	if err != nil {
 		return errors.Wrapf(err, "failed to read segment's directory: %s", sc.path)
 	}
 
-	// find closest files to read and write
+	// find the closest files to read and write
 	for i, f := range files {
 		if segID, err = sc.getSegIDByFileName(f.Name()); err != nil {
 			continue
@@ -101,7 +99,12 @@ func (sc *segmentsController) load() error {
 
 		// last segment will be current writer, so track segID and offset
 		maxSegID = segID
-		sc.metaWrite.offset = uint32(f.Size())
+
+		fileInfo, infoErr := f.Info()
+		if infoErr != nil {
+			return errors.Wrapf(infoErr, "unexpected error on get file info %s", f.Name())
+		}
+		sc.metaWrite.offset = uint32(fileInfo.Size())
 	}
 
 	sc.metaWrite.segID = maxSegID
@@ -145,11 +148,11 @@ func (sc *segmentsController) openWriter(segID uint32) (err error) {
 // that is not thread-safe.
 func (sc *segmentsController) sync() error {
 	if err := sc.writer.Flush(); err != nil {
-		return errors.Wrap(err, "failed to flush writer on sync segment")
+		return errors.Wrapf(err, "failed to flush writer on sync segment %d", sc.metaWrite.segID)
 	}
 
 	if err := sc.writeFd.Sync(); err != nil {
-		return errors.Wrap(err, "failed to sync segment's fd")
+		return errors.Wrapf(err, "failed to sync segment's fd for segment %d", sc.metaWrite.segID)
 	}
 
 	return nil
@@ -211,7 +214,7 @@ func (sc *segmentsController) fileNameBySegID(segID uint32) string {
 func (sc *segmentsController) getSegIDByFileName(name string) (uint32, error) {
 	var segID uint32
 	if _, err := fmt.Sscanf(name, dataSegmentsPattern, &segID); err != nil {
-		return 0, errors.Wrap(err, "scanning segment pattern failed")
+		return 0, errors.Wrapf(err, "scanning segment pattern failed for file '%s'", name)
 	}
 	return segID, nil
 }
@@ -227,14 +230,14 @@ func (sc *segmentsController) flushWriter() (err error) {
 	sc.writeLock.Lock()
 	if err = sc.writer.Flush(); err != nil {
 		sc.writeLock.Unlock()
-		return errors.Wrap(err, "failed flush writer")
+		return errors.Wrapf(err, "failed flush writer for segment %d", sc.metaWrite.segID)
 	}
 	sc.writeLock.Unlock()
 	return nil
 }
 
 // readOne tries to read one entry from disk
-// if take an EOF error check writer and flush it if needed or go to next read file
+// if we take an EOF error check writer and flush it if needed or go to next read file
 // if end offset will be over than maxBytesPerSegment go to next read file too
 func (sc *segmentsController) readOne() (data []byte, segID uint32, offset uint32, err error) {
 	var (
@@ -247,7 +250,7 @@ startRead:
 	if _, err := io.ReadFull(sc.reader, sc.readHeaderBuf[:]); err != nil {
 		if err == io.EOF {
 			// if it happens when writer buffered but not already flushed?
-			// lets check and try to flush it
+			// let's check and try to flush it
 			if !once && sc.metaWrite.segID == sc.metaRead.segID {
 				if err = sc.flushWriter(); err != nil {
 					return nil, 0, 0, err
@@ -347,7 +350,7 @@ func (sc *segmentsController) writeOne(data []byte) (segID uint32, offset uint32
 
 	if len(data)+headerSize > sc.writer.Available() {
 		if err := sc.writer.Flush(); err != nil {
-			return 0, 0, errors.Wrap(err, "flush segment writer")
+			return 0, 0, errors.Wrapf(err, "flush segment writer for segment %d", segID)
 		}
 	}
 
@@ -356,11 +359,11 @@ func (sc *segmentsController) writeOne(data []byte) (segID uint32, offset uint32
 	binary.BigEndian.PutUint32(sc.writeHeaderBuf[4:], crc32.Checksum(data, sc.crc32Table))
 
 	if _, err = sc.writer.Write(sc.writeHeaderBuf[:]); err != nil {
-		return 0, 0, errors.Wrap(err, "write header")
+		return 0, 0, errors.Wrapf(err, "write header for segment %d at offset %d", segID, offset)
 	}
 
 	if _, err = sc.writer.Write(data); err != nil {
-		return 0, 0, errors.Wrap(err, "write data")
+		return 0, 0, errors.Wrapf(err, "write data for segment %d at offset %d", segID, offset)
 	}
 
 	// meta for current written data
@@ -370,14 +373,14 @@ func (sc *segmentsController) writeOne(data []byte) (segID uint32, offset uint32
 	// update meta for next write
 	sc.metaWrite.offset = sc.metaWrite.offset + headerSize + dataSize
 
-	if err = sc.mayBeNextWriteSegment(); err != nil {
+	if err = sc.rotateSegmentIfFull(); err != nil {
 		return 0, 0, err
 	}
 
 	return
 }
 
-func (sc *segmentsController) mayBeNextWriteSegment() error {
+func (sc *segmentsController) rotateSegmentIfFull() error {
 	if sc.metaWrite.offset > sc.maxBytesPerSegment {
 		// Flush any buffered data and Sync for strong consistency
 		if err := sc.sync(); err != nil {
@@ -407,7 +410,7 @@ func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta)
 	fileName := sc.fileNameBySegID(segID)
 	fileNameTmp := fileName + ".tmp"
 	if fd, err = os.OpenFile(fileName, os.O_RDONLY, 0600); err != nil {
-		return newOffsets, err
+		return newOffsets, errors.Wrapf(err, "failed to open segment file: %s", fileName)
 	}
 	defer func() {
 		if closeErr := fd.Close(); closeErr != nil && err == nil {
@@ -416,7 +419,7 @@ func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta)
 	}()
 
 	if fdTmp, err = os.OpenFile(fileNameTmp, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600); err != nil {
-		return newOffsets, err
+		return newOffsets, errors.Wrapf(err, "failed to create temp file: %s", fileNameTmp)
 	}
 
 	reader := bufio.NewReaderSize(fd, int(sc.readBufferSize))
@@ -457,20 +460,31 @@ func (sc *segmentsController) compactSegment(segID uint32, meta *compactionMeta)
 		readerPos += 4 + size + 4
 	}
 
+	if err != nil {
+		if err == io.EOF {
+			// all is ok, ignore
+		} else if err == io.ErrUnexpectedEOF {
+			log.Printf("segment truncated at pos %d, ignoring partial message", readerPos)
+		} else {
+			// something really going wrong
+			return nil, err
+		}
+	}
+
 	if err != nil && err != io.EOF {
 		return nil, err
 	}
 
 	if err = writer.Flush(); err != nil {
-		return newOffsets, err
+		return newOffsets, errors.Wrapf(err, "failed to flush writer for file: %s", fileNameTmp)
 	}
 
 	if err = fdTmp.Sync(); err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to sync temp file: %s", fileNameTmp)
 	}
 
 	if err = fdTmp.Close(); err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to close temp file: %s", fileNameTmp)
 	}
 
 	return newOffsets, os.Rename(fileNameTmp, fileName)
@@ -487,7 +501,7 @@ func (sc *segmentsController) Clean() error {
 		return err
 	}
 
-	files, err := ioutil.ReadDir(sc.path)
+	files, err := os.ReadDir(sc.path)
 	if err != nil {
 		return errors.Wrapf(err, "failed to read segment's directory: %s", sc.path)
 	}
