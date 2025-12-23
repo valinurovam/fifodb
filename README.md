@@ -1,4 +1,9 @@
-## FifoDB [![Build Status](https://travis-ci.org/valinurovam/fifodb.svg?branch=main)](https://travis-ci.org/valinurovam/fifodb) [![Coverage Status](https://coveralls.io/repos/github/valinurovam/fifodb/badge.svg)](https://coveralls.io/github/valinurovam/fifodb) [![Go Report Card](https://goreportcard.com/badge/github.com/valinurovam/fifodb)](https://goreportcard.com/report/github.com/valinurovam/fifodb)
+# fifodb
+
+[![CI](https://github.com/valinurovam/fifodb/actions/workflows/ci.yml/badge.svg)](https://github.com/valinurovam/fifodb/actions/workflows/ci.yml)
+[![Coverage](https://codecov.io/gh/valinurovam/fifodb/branch/main/graph/badge.svg)](https://codecov.io/gh/valinurovam/fifodb)
+[![Go Report Card](https://goreportcard.com/badge/github.com/valinurovam/fifodb)](https://goreportcard.com/report/github.com/valinurovam/fifodb)
+[![License](https://img.shields.io/github/license/valinurovam/fifodb)](LICENSE)
 
 `fifodb` is an embedded, disk-based FIFO queue implemented in Go.  
 It is designed for applications that require strict message ordering, crash resilience, and minimal external dependencies, without the overhead of a full message broker.
